@@ -1,0 +1,7 @@
+bin/
+*.exe
+dist/
+keys/
+*.qcow2
+*.img
+*.tar.gz
