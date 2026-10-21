@@ -6,19 +6,20 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"time"
 
 	"github.com/uday68/gdc-airgap-sync/pkg/crypto"
 	"github.com/uday68/gdc-airgap-sync/pkg/manifest"
+	"github.com/uday68/gdc-airgap-sync/pkg/pathutil"
 	"gopkg.in/yaml.v3"
 )
 
-// BundleOptions specifies packaging parameters.
+// BundleOptions specifies packaging and signing parameters.
 type BundleOptions struct {
 	Name           string
 	SourceFilePath string
@@ -27,12 +28,29 @@ type BundleOptions struct {
 	SignerIdentity string
 	PrivateKey     ed25519.PrivateKey
 	OutputPath     string
+	Origin         string
+	ReleaseID      string
+	SBOMPath       string
+	DemoFixture    bool
+	Timestamp      time.Time
 }
 
 // CreateBundle builds and signs a compressed .tar.gz air-gap release archive.
 func CreateBundle(opts BundleOptions) (*manifest.BundleManifest, error) {
-	if opts.Name == "" || opts.SourceFilePath == "" {
-		return nil, fmt.Errorf("name and source file path are required")
+	if err := pathutil.ValidateResourceName(opts.Name); err != nil {
+		return nil, fmt.Errorf("invalid artifact name: %w", err)
+	}
+	if opts.SourceFilePath == "" {
+		return nil, fmt.Errorf("source file path is required")
+	}
+	if len(opts.PrivateKey) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("invalid private key")
+	}
+	if opts.SignerIdentity == "" {
+		return nil, fmt.Errorf("signer identity is required")
+	}
+	if opts.OutputPath == "" {
+		return nil, fmt.Errorf("output path is required")
 	}
 
 	srcInfo, err := os.Stat(opts.SourceFilePath)
@@ -40,13 +58,39 @@ func CreateBundle(opts BundleOptions) (*manifest.BundleManifest, error) {
 		return nil, fmt.Errorf("source artifact file not found: %w", err)
 	}
 
-	// 1. Calculate streaming SHA-256
+	filename := filepath.Base(opts.SourceFilePath)
+	if err := pathutil.ValidateFilename(filename); err != nil {
+		return nil, fmt.Errorf("invalid source filename: %w", err)
+	}
+
+	// 1. Calculate streaming SHA-256 of artifact
 	fileHash, err := computeSHA256(opts.SourceFilePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed computing artifact digest: %w", err)
 	}
 
-	filename := filepath.Base(opts.SourceFilePath)
+	// Determine normalized timestamp for reproducible packaging
+	buildTime := opts.Timestamp
+	if buildTime.IsZero() {
+		buildTime = srcInfo.ModTime().UTC().Truncate(time.Second)
+	} else {
+		buildTime = buildTime.UTC().Truncate(time.Second)
+	}
+
+	// Truthful origin
+	origin := opts.Origin
+	if origin == "" {
+		if opts.DemoFixture {
+			origin = "fixture:demo-pipeline"
+		} else {
+			origin = "developer-build"
+		}
+	}
+
+	// Public key and KeyID fingerprint
+	pubKey := opts.PrivateKey.Public().(ed25519.PublicKey)
+	keyID := crypto.PublicKeyFingerprint(pubKey)
+
 	artifact := manifest.ArtifactMeta{
 		Name:        opts.Name,
 		Filename:    filename,
@@ -54,26 +98,68 @@ func CreateBundle(opts BundleOptions) (*manifest.BundleManifest, error) {
 		SizeBytes:   srcInfo.Size(),
 		OSFamily:    opts.OSFamily,
 		Description: opts.Description,
+		AddedAt:     buildTime,
+	}
+
+	// Handle SBOM
+	var sbomMeta manifest.SBOMMeta
+	var sbomBytes []byte
+
+	if opts.SBOMPath != "" {
+		data, err := os.ReadFile(opts.SBOMPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed reading SBOM file: %w", err)
+		}
+		sbomBytes = data
+		h := sha256.Sum256(data)
+		sbomMeta = manifest.SBOMMeta{
+			Format:   "SPDX-2.3",
+			Filename: "sbom.json",
+			SHA256:   hex.EncodeToString(h[:]),
+		}
+	} else if opts.DemoFixture {
+		sbomBytes = []byte(`{"spdxVersion":"SPDX-2.3","dataLicense":"CC0-1.0","SPDXID":"SPDXRef-DOCUMENT","name":"synthetic-demo-sbom"}`)
+		h := sha256.Sum256(sbomBytes)
+		sbomMeta = manifest.SBOMMeta{
+			Format:        "SPDX-2.3",
+			SpecVersion:   "2.3",
+			Filename:      "sbom.json",
+			SHA256:        hex.EncodeToString(h[:]),
+			PackagesCount: 1,
+			KeyPackages:   []string{"synthetic-base-package"},
+		}
+	} else {
+		sbomMeta = manifest.SBOMMeta{
+			Format: "none",
+		}
+	}
+
+	bundleID := opts.Name
+	if opts.ReleaseID != "" {
+		bundleID = fmt.Sprintf("%s-%s", opts.Name, opts.ReleaseID)
+	} else {
+		bundleID = fmt.Sprintf("%s-%d", opts.Name, buildTime.Unix())
 	}
 
 	// 2. Construct Manifest
 	mf := &manifest.BundleManifest{
-		APIVersion:     "airgap.gdc.io/v1alpha1",
-		Kind:           "AirGapBundle",
-		BundleID:       fmt.Sprintf("%s-%d", opts.Name, time.Now().Unix()),
-		CreatedAt:      time.Now().UTC(),
-		Origin:         "Google Cloud Build / Verified RelEng Pipeline",
+		APIVersion:     manifest.ExpectedAPIVersion,
+		Kind:           manifest.ExpectedKind,
+		BundleID:       bundleID,
+		ReleaseID:      opts.ReleaseID,
+		CreatedAt:      buildTime,
+		Origin:         origin,
 		SignerIdentity: opts.SignerIdentity,
+		KeyID:          keyID,
 		Artifacts:      []manifest.ArtifactMeta{artifact},
-		SBOM: manifest.SBOMMeta{
-			Format:        "SPDX-2.3",
-			SpecVersion:   "2.3",
-			PackagesCount: 420,
-			KeyPackages:   []string{"linux-image-generic", "systemd", "openssh-server", "cloud-init"},
-		},
+		SBOM:           sbomMeta,
 	}
 
-	// 3. Cryptographic Signature
+	if err := mf.Validate(); err != nil {
+		return nil, fmt.Errorf("manifest validation failed: %w", err)
+	}
+
+	// 3. Cryptographic Signature over Canonical Bytes
 	canonicalBytes, err := mf.CanonicalBytes()
 	if err != nil {
 		return nil, err
@@ -81,70 +167,100 @@ func CreateBundle(opts BundleOptions) (*manifest.BundleManifest, error) {
 	mf.Signature = crypto.Sign(opts.PrivateKey, canonicalBytes)
 
 	// 4. Create destination directory if needed
-	if err := os.MkdirAll(filepath.Dir(opts.OutputPath), 0755); err != nil {
+	outDir := filepath.Dir(opts.OutputPath)
+	if err := os.MkdirAll(outDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed creating output directory: %w", err)
 	}
 
-	// 5. Write .tar.gz bundle
-	outFile, err := os.Create(opts.OutputPath)
+	// 5. Stage writing to temporary file for atomic publishing
+	tmpFile, err := os.CreateTemp(outDir, ".tmp-bundle-*.tar.gz")
 	if err != nil {
-		return nil, fmt.Errorf("failed creating bundle archive: %w", err)
+		return nil, fmt.Errorf("failed creating temp bundle archive: %w", err)
 	}
-	defer outFile.Close()
+	tmpPath := tmpFile.Name()
 
-	gw := gzip.NewWriter(outFile)
-	defer gw.Close()
+	var success bool
+	defer func() {
+		if !success {
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	gw := gzip.NewWriter(tmpFile)
+	gw.Header.ModTime = buildTime
+	gw.Header.OS = 255 // normalized unknown OS for reproducible archives
 
 	tw := tar.NewWriter(gw)
-	defer tw.Close()
 
-	// Add manifest.yaml to tar
+	// Entry 1: manifest.yaml (MUST BE FIRST)
 	manifestYAML, err := yaml.Marshal(mf)
 	if err != nil {
 		return nil, fmt.Errorf("failed marshaling manifest YAML: %w", err)
 	}
-	if err := addFileToTar(tw, "manifest.yaml", manifestYAML); err != nil {
+	if err := addFileToTar(tw, "manifest.yaml", manifestYAML, buildTime); err != nil {
 		return nil, err
 	}
 
-	// Add sbom.json to tar
-	sbomJSON, err := json.MarshalIndent(mf.SBOM, "", "  ")
-	if err != nil {
-		return nil, fmt.Errorf("failed marshaling SBOM: %w", err)
-	}
-	if err := addFileToTar(tw, "sbom.json", sbomJSON); err != nil {
-		return nil, err
+	// Entry 2: sbom.json (if present)
+	if len(sbomBytes) > 0 {
+		if err := addFileToTar(tw, "sbom.json", sbomBytes, buildTime); err != nil {
+			return nil, err
+		}
 	}
 
-	// Add artifact disk image to tar
+	// Entry 3: artifacts/<clean-filename> (MUST use forward slash)
 	srcFile, err := os.Open(opts.SourceFilePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed opening source file: %w", err)
 	}
 	defer srcFile.Close()
 
+	tarArtifactPath := path.Join("artifacts", filename)
 	hdr := &tar.Header{
-		Name:    filepath.Join("artifacts", filename),
-		Mode:    0644,
-		Size:    srcInfo.Size(),
-		ModTime: time.Now(),
+		Name:     tarArtifactPath,
+		Mode:     0644,
+		Size:     srcInfo.Size(),
+		ModTime:  buildTime,
+		Typeflag: tar.TypeReg,
+		Format:   tar.FormatPAX,
 	}
 	if err := tw.WriteHeader(hdr); err != nil {
-		return nil, fmt.Errorf("failed writing tar header: %w", err)
+		return nil, fmt.Errorf("failed writing tar header for %s: %w", tarArtifactPath, err)
 	}
 	if _, err := io.Copy(tw, srcFile); err != nil {
 		return nil, fmt.Errorf("failed copying artifact to tar: %w", err)
 	}
 
+	if err := tw.Close(); err != nil {
+		return nil, fmt.Errorf("failed finalizing tar: %w", err)
+	}
+	if err := gw.Close(); err != nil {
+		return nil, fmt.Errorf("failed finalizing gzip: %w", err)
+	}
+	if err := tmpFile.Sync(); err != nil {
+		return nil, fmt.Errorf("failed syncing bundle: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return nil, fmt.Errorf("failed closing temp bundle: %w", err)
+	}
+
+	if err := pathutil.SafeReplaceFile(tmpPath, opts.OutputPath); err != nil {
+		return nil, fmt.Errorf("failed committing bundle file: %w", err)
+	}
+
+	success = true
 	return mf, nil
 }
 
-func addFileToTar(tw *tar.Writer, name string, content []byte) error {
+func addFileToTar(tw *tar.Writer, name string, content []byte, modTime time.Time) error {
 	hdr := &tar.Header{
-		Name:    name,
-		Mode:    0644,
-		Size:    int64(len(content)),
-		ModTime: time.Now(),
+		Name:     name,
+		Mode:     0644,
+		Size:     int64(len(content)),
+		ModTime:  modTime,
+		Typeflag: tar.TypeReg,
+		Format:   tar.FormatPAX,
 	}
 	if err := tw.WriteHeader(hdr); err != nil {
 		return fmt.Errorf("failed writing tar header for %s: %w", name, err)

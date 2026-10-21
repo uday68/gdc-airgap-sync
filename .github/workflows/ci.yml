@@ -8,7 +8,7 @@ on:
 
 jobs:
   test:
-    name: Unit Tests & Static Analysis
+    name: Unit Tests, Race Detection & Static Analysis
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -24,8 +24,18 @@ jobs:
           go-version: ${{ matrix.go-version }}
           cache: true
 
+      - name: Verify Dependencies
+        run: go mod verify
+
       - name: Run Go Vet
         run: go vet ./...
 
       - name: Run Tests
         run: go test -v ./...
+
+      - name: Run Race Detector (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: go test -race -v ./...
+
+      - name: Build CLI Binary
+        run: go build -v -o bin/airgap-sync ./cmd/airgap-sync

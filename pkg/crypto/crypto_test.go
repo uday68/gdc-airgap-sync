@@ -1,8 +1,10 @@
 package crypto
 
 import (
+	"crypto/ed25519"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -35,6 +37,14 @@ func TestCrypto_SignAndVerify(t *testing.T) {
 	otherPub, _, _ := GenerateKeypair()
 	if Verify(otherPub, payload, sigHex) {
 		t.Fatalf("expected verification failure with different public key")
+	}
+
+	// 5. Invalid hex or size
+	if Verify(pub, payload, "not-hex") {
+		t.Errorf("expected failure on invalid hex")
+	}
+	if Verify(ed25519.PublicKey([]byte("short")), payload, sigHex) {
+		t.Errorf("expected failure on short pubkey")
 	}
 }
 
@@ -73,5 +83,26 @@ func TestCrypto_PEMExportAndImport(t *testing.T) {
 	sig := Sign(loadedPriv, data)
 	if !Verify(loadedPub, data, sig) {
 		t.Fatalf("failed verification with PEM reloaded keys")
+	}
+}
+
+func TestCrypto_PublicKeyFingerprint(t *testing.T) {
+	pub, _, err := GenerateKeypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fp := PublicKeyFingerprint(pub)
+	if !strings.HasPrefix(fp, "sha256:") {
+		t.Fatalf("expected sha256 prefix, got: %s", fp)
+	}
+	hexPart := strings.TrimPrefix(fp, "sha256:")
+	if len(hexPart) != 64 {
+		t.Fatalf("expected 64 hex characters, got: %d", len(hexPart))
+	}
+
+	// Deterministic
+	if PublicKeyFingerprint(pub) != fp {
+		t.Errorf("fingerprint is not deterministic")
 	}
 }
