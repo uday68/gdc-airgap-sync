@@ -106,3 +106,36 @@ func TestCrypto_PublicKeyFingerprint(t *testing.T) {
 		t.Errorf("fingerprint is not deterministic")
 	}
 }
+
+func BenchmarkCrypto_Ed25519Sign(b *testing.B) {
+	_, priv, err := GenerateKeypair()
+	if err != nil {
+		b.Fatal(err)
+	}
+	payload := []byte("SIMULATED_CANONICAL_MANIFEST_PAYLOAD_FOR_BENCHMARK")
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = Sign(priv, payload)
+	}
+}
+
+func BenchmarkCrypto_Ed25519Verify(b *testing.B) {
+	pub, priv, err := GenerateKeypair()
+	if err != nil {
+		b.Fatal(err)
+	}
+	payload := []byte("SIMULATED_CANONICAL_MANIFEST_PAYLOAD_FOR_BENCHMARK")
+	sigHex := Sign(priv, payload)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if !Verify(pub, payload, sigHex) {
+			b.Fatal("verify failed")
+		}
+	}
+}
+
+

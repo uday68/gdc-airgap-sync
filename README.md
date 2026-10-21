@@ -119,4 +119,22 @@ go test -fuzz=FuzzParseManifest -fuzztime=5s ./pkg/manifest
 go test -fuzz=FuzzIngestArchive -fuzztime=5s ./pkg/ingest
 ```
 
+---
+
+## 5. Performance Benchmarks
+
+Measured on a 12th Gen Intel(R) Core(TM) i5-12450H (Windows amd64):
+
+| Benchmark | Iterations | Latency / Throughput | Memory Allocations | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| **Ed25519 Signing** (`BenchmarkCrypto_Ed25519Sign`) | 16,119 | **84.03 µs/op** (~11.9K signs/sec) | 256 B/op, 2 allocs/op | High-throughput release packaging |
+| **Ed25519 Verification** (`BenchmarkCrypto_Ed25519Verify`) | 8,746 | **192.81 µs/op** (~5.2K verifies/sec) | 64 B/op, 1 alloc/op | In-memory signature verification before extraction |
+| **Ingestion Pipeline** (`BenchmarkIngest_5MBBundle`) | 6 | **23.96 MB/s** (218.80 ms/5MB) | 225,976 B/op, 857 allocs/op | Full pipeline: Ed25519 check + streaming SHA-256 + atomic catalog update |
+
+Run benchmarks locally:
+```bash
+go test -bench=Benchmark -benchmem -run=^$ ./pkg/crypto ./pkg/ingest
+```
+
+
 For interview talking points and architectural deep dives, consult the [Interview Study Guide](docs/INTERVIEW_STUDY_GUIDE.md).

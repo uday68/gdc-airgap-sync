@@ -808,3 +808,65 @@ func writeCustomArchive(t *testing.T, outPath string, mf *manifest.BundleManifes
 		}
 	}
 }
+
+func BenchmarkIngest_5MBBundle(b *testing.B) {
+	tempDir, err := os.MkdirTemp("", "bench-ingest-*")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	pub, priv, err := crypto.GenerateKeypair()
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	payloadSize := 5 * 1024 * 1024 // 5 MB
+	srcFile := filepath.Join(tempDir, "bench-disk.raw")
+	f, err := os.Create(srcFile)
+	if err != nil {
+		b.Fatal(err)
+	}
+	chunk := make([]byte, 64*1024)
+	for i := range chunk {
+		chunk[i] = byte(i % 256)
+	}
+	var written int
+	for written < payloadSize {
+		n, _ := f.Write(chunk)
+		written += n
+	}
+	_ = f.Close()
+
+	bundlePath := filepath.Join(tempDir, "bench.bundle.tar.gz")
+	_, err = bundler.CreateBundle(bundler.BundleOptions{
+		Name:           "bench-vm",
+		SourceFilePath: srcFile,
+		SignerIdentity: "bench@supplychain.org",
+		PrivateKey:     priv,
+		OutputPath:     bundlePath,
+		DemoFixture:    true,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	registryDir := filepath.Join(tempDir, "registry")
+
+	b.SetBytes(int64(payloadSize))
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_, err := IngestBundleWithOptions(IngestOptions{
+			BundlePath:        bundlePath,
+			TrustedPubKey:     pub,
+			TargetRegistryDir: registryDir,
+			AllowOverwrite:    true,
+		})
+		if err != nil {
+			b.Fatalf("ingest benchmark iteration failed: %v", err)
+		}
+	}
+}
+
